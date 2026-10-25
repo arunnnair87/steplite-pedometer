@@ -1,22 +1,700 @@
 name: Build StepLite Android APK
-on: [push, workflow_dispatch]
+
+on:
+  push:
+  workflow_dispatch:
+
 jobs:
   build-apk:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: 'temurin'
-      - uses: gradle/actions/setup-gradle@v3
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
         with:
           gradle-version: '8.7'
-      - name: Compile Debug APK
+
+      - name: Prepare & Verify Android Project Structure
         run: |
-          if [ -f "StepLiteAndroid/settings.gradle.kts" ]; then cd StepLiteAndroid; fi
+          mkdir -p build_workspace/app/src/main/java/com/steplite/pedometer
+          cd build_workspace
+          cat << 'EOF_FILE' > gradle.properties
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          android.nonTransitiveRClass=true
+          EOF_FILE
+          cat << 'EOF_FILE' > settings.gradle.kts
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "StepLite"
+          include(":app")
+          EOF_FILE
+          cat << 'EOF_FILE' > build.gradle.kts
+          plugins {
+              id("com.android.application") version "8.2.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.22" apply false
+          }
+          EOF_FILE
+          cat << 'EOF_FILE' > app/build.gradle.kts
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          
+          android {
+              namespace = "com.steplite.pedometer"
+              compileSdk = 34
+          
+              defaultConfig {
+                  applicationId = "com.steplite.pedometer"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0.0"
+              }
+          
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+          
+          dependencies {
+              // Pure Android SDK + Kotlin stdlib for 100% reliable build & <1.5 MB APK size
+          }
+          EOF_FILE
+          cat << 'EOF_FILE' > app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+          
+              <uses-permission android:name="android.permission.ACTIVITY_RECOGNITION" />
+              <uses-permission android:name="android.permission.HIGH_SAMPLING_RATE_SENSORS" />
+          
+              <uses-feature android:name="android.hardware.sensor.accelerometer" android:required="true" />
+              <uses-feature android:name="android.hardware.sensor.stepcounter" android:required="false" />
+          
+              <application
+                  android:allowBackup="true"
+                  android:label="StepLite Pedometer"
+                  android:supportsRtl="true"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+          
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize|keyboardHidden">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF_FILE
+          cat << 'EOF_FILE' > app/src/main/java/com/steplite/pedometer/StepDatabaseHelper.kt
+          package com.steplite.pedometer
+          
+          import android.content.ContentValues
+          import android.content.Context
+          import android.database.sqlite.SQLiteDatabase
+          import android.database.sqlite.SQLiteOpenHelper
+          import java.text.SimpleDateFormat
+          import java.util.Calendar
+          import java.util.Date
+          import java.util.Locale
+          
+          data class PeriodStat(
+              val label: String,
+              val fullLabel: String,
+              val steps: Int,
+              val daysCount: Int
+          )
+          
+          class StepDatabaseHelper(context: Context) :
+              SQLiteOpenHelper(context, "steplite_multiyear.db", null, 1) {
+          
+              override fun onCreate(db: SQLiteDatabase) {
+                  db.execSQL(
+                      """
+                      CREATE TABLE IF NOT EXISTS daily_steps (
+                          date_iso TEXT PRIMARY KEY,
+                          year INTEGER NOT NULL,
+                          year_month TEXT NOT NULL,
+                          steps INTEGER NOT NULL,
+                          goal INTEGER NOT NULL
+                      )
+                      """
+                  )
+                  db.execSQL("CREATE INDEX IF NOT EXISTS idx_year ON daily_steps(year)")
+                  db.execSQL("CREATE INDEX IF NOT EXISTS idx_ym ON daily_steps(year_month)")
+              }
+          
+              override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) = Unit
+          
+              private fun todayIso(): String =
+                  SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
+          
+              fun getTodaySteps(): Int {
+                  val iso = todayIso()
+                  readableDatabase.rawQuery(
+                      "SELECT steps FROM daily_steps WHERE date_iso = ?",
+                      arrayOf(iso)
+                  ).use { c ->
+                      return if (c.moveToFirst()) c.getInt(0) else 0
+                  }
+              }
+          
+              fun addStepsToday(delta: Int, goal: Int): Int {
+                  val now = Date()
+                  val iso = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(now)
+                  val ym = SimpleDateFormat("yyyy-MM", Locale.US).format(now)
+                  val yr = SimpleDateFormat("yyyy", Locale.US).format(now).toInt()
+          
+                  val current = getTodaySteps()
+                  val updated = (current + delta).coerceAtLeast(0)
+          
+                  val cv = ContentValues().apply {
+                      put("date_iso", iso)
+                      put("year", yr)
+                      put("year_month", ym)
+                      put("steps", updated)
+                      put("goal", goal)
+                  }
+                  writableDatabase.insertWithOnConflict(
+                      "daily_steps",
+                      null,
+                      cv,
+                      SQLiteDatabase.CONFLICT_REPLACE
+                  )
+                  return updated
+              }
+          
+              fun resetToday(goal: Int) {
+                  val now = Date()
+                  val iso = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(now)
+                  val ym = SimpleDateFormat("yyyy-MM", Locale.US).format(now)
+                  val yr = SimpleDateFormat("yyyy", Locale.US).format(now).toInt()
+                  val cv = ContentValues().apply {
+                      put("date_iso", iso)
+                      put("year", yr)
+                      put("year_month", ym)
+                      put("steps", 0)
+                      put("goal", goal)
+                  }
+                  writableDatabase.insertWithOnConflict(
+                      "daily_steps",
+                      null,
+                      cv,
+                      SQLiteDatabase.CONFLICT_REPLACE
+                  )
+              }
+          
+              fun getLastNDays(days: Int): List<PeriodStat> {
+                  val list = mutableListOf<PeriodStat>()
+                  val cal = Calendar.getInstance()
+                  val isoFmt = SimpleDateFormat("yyyy-MM-dd", Locale.US)
+                  val shortFmt = SimpleDateFormat("EEE", Locale.US)
+          
+                  val map = mutableMapOf<String, Int>()
+                  readableDatabase.rawQuery(
+                      "SELECT date_iso, steps FROM daily_steps ORDER BY date_iso DESC LIMIT ?",
+                      arrayOf(days.toString())
+                  ).use { c ->
+                      while (c.moveToNext()) {
+                          map[c.getString(0)] = c.getInt(1)
+                      }
+                  }
+          
+                  cal.add(Calendar.DAY_OF_YEAR, -(days - 1))
+                  for (i in 0 until days) {
+                      val d = cal.time
+                      val iso = isoFmt.format(d)
+                      val label = if (i == days - 1) "Today" else shortFmt.format(d)
+                      list.add(PeriodStat(label, iso, map[iso] ?: 0, 1))
+                      cal.add(Calendar.DAY_OF_YEAR, 1)
+                  }
+                  return list
+              }
+          
+              fun getMonthlyTotalsForCurrentYear(): List<PeriodStat> {
+                  val yr = SimpleDateFormat("yyyy", Locale.US).format(Date()).toInt()
+                  val map = mutableMapOf<String, Int>()
+                  readableDatabase.rawQuery(
+                      "SELECT year_month, SUM(steps) FROM daily_steps WHERE year = ? GROUP BY year_month",
+                      arrayOf(yr.toString())
+                  ).use { c ->
+                      while (c.moveToNext()) {
+                          map[c.getString(0)] = c.getInt(1)
+                      }
+                  }
+                  val months = arrayOf("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+                  return months.mapIndexed { idx, mName ->
+                      val ym = String.format(Locale.US, "%04d-%02d", yr, idx + 1)
+                      PeriodStat(mName, "$mName $yr", map[ym] ?: 0, 30)
+                  }
+              }
+          
+              fun getMultiYearTotals(): List<PeriodStat> {
+                  val currentYear = SimpleDateFormat("yyyy", Locale.US).format(Date()).toInt()
+                  val map = mutableMapOf<Int, Int>()
+                  readableDatabase.rawQuery(
+                      "SELECT year, SUM(steps) FROM daily_steps GROUP BY year ORDER BY year ASC",
+                      null
+                  ).use { c ->
+                      while (c.moveToNext()) {
+                          map[c.getInt(0)] = c.getInt(1)
+                      }
+                  }
+                  return ((currentYear - 4)..currentYear).map { y ->
+                      PeriodStat(y.toString(), "Year $y", map[y] ?: 0, 365)
+                  }
+              }
+          }
+          EOF_FILE
+          cat << 'EOF_FILE' > app/src/main/java/com/steplite/pedometer/MainActivity.kt
+          package com.steplite.pedometer
+          
+          import android.app.Activity
+          import android.content.Context
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
+          import android.hardware.Sensor
+          import android.hardware.SensorEvent
+          import android.hardware.SensorEventListener
+          import android.hardware.SensorManager
+          import android.os.Bundle
+          import android.os.SystemClock
+          import android.view.Gravity
+          import android.view.View
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.ProgressBar
+          import android.widget.ScrollView
+          import android.widget.SeekBar
+          import android.widget.TextView
+          import java.util.Locale
+          import kotlin.math.roundToInt
+          import kotlin.math.sqrt
+          
+          class MainActivity : Activity(), SensorEventListener {
+          
+              private lateinit var db: StepDatabaseHelper
+              private lateinit var sensorManager: SensorManager
+          
+              private var stepsToday = 0
+              private var dailyGoal = 6000
+              private var strideCm = 74
+              private var peakThreshold = 11.8f
+              private var isTracking = true
+              private var historyMode = "7D" // "7D", "30D", "12M", "YEARS"
+          
+              // Accelerometer peak filter state
+              private var smoothedMag = 9.81f
+              private var lastMag = 9.81f
+              private var wasAboveThreshold = false
+              private var lastStepTimeMs = 0L
+              private var rejectedShakes = 0
+              private var lastHardwareSteps: Int? = null
+          
+              // UI references
+              private lateinit var tvSteps: TextView
+              private lateinit var tvGoalSub: TextView
+              private lateinit var tvDistance: TextView
+              private lateinit var tvCalories: TextView
+              private lateinit var tvLiveAccel: TextView
+              private lateinit var tvHistoryTitle: TextView
+              private lateinit var historyContainer: LinearLayout
+              private lateinit var progressRing: ProgressBar
+              private lateinit var btnTrackToggle: Button
+          
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  db = StepDatabaseHelper(this)
+                  stepsToday = db.getTodaySteps()
+                  sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
+          
+                  setContentView(buildRootLayout())
+                  refreshUI()
+              }
+          
+              override fun onResume() {
+                  super.onResume()
+                  registerSensors()
+              }
+          
+              override fun onPause() {
+                  super.onPause()
+                  sensorManager.unregisterListener(this)
+              }
+          
+              private fun registerSensors() {
+                  sensorManager.unregisterListener(this)
+                  if (!isTracking) return
+          
+                  val stepSensor = sensorManager.getDefaultSensor(Sensor.TYPE_STEP_COUNTER)
+                  if (stepSensor != null) {
+                      sensorManager.registerListener(this, stepSensor, SensorManager.SENSOR_DELAY_UI)
+                  }
+                  val accel = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+                  if (accel != null) {
+                      sensorManager.registerListener(this, accel, SensorManager.SENSOR_DELAY_GAME)
+                  }
+              }
+          
+              override fun onSensorChanged(event: SensorEvent) {
+                  if (!isTracking) return
+          
+                  if (event.sensor.type == Sensor.TYPE_STEP_COUNTER) {
+                      val total = event.values[0].toInt()
+                      val prev = lastHardwareSteps
+                      lastHardwareSteps = total
+                      if (prev != null && total > prev) {
+                          stepsToday = db.addStepsToday(total - prev, dailyGoal)
+                          refreshUI()
+                      }
+                  } else if (event.sensor.type == Sensor.TYPE_ACCELEROMETER) {
+                      val ax = event.values[0]
+                      val ay = event.values[1]
+                      val az = event.values[2]
+                      val rawMag = sqrt(ax * ax + ay * ay + az * az)
+                      smoothedMag = 0.65f * smoothedMag + 0.35f * rawMag
+          
+                      val nowMs = SystemClock.elapsedRealtime()
+                      if (!wasAboveThreshold && smoothedMag >= peakThreshold && lastMag < peakThreshold) {
+                          wasAboveThreshold = true
+                          val deltaMs = nowMs - lastStepTimeMs
+                          if (smoothedMag > 24.0f || (lastStepTimeMs > 0L && deltaMs < 250L)) {
+                              rejectedShakes++
+                          } else {
+                              lastStepTimeMs = nowMs
+                              if (lastHardwareSteps == null) {
+                                  stepsToday = db.addStepsToday(1, dailyGoal)
+                              }
+                          }
+                      } else if (smoothedMag < peakThreshold - 0.6f) {
+                          wasAboveThreshold = false
+                      }
+                      lastMag = smoothedMag
+                      tvLiveAccel.text = String.format(
+                          Locale.US,
+                          "Sensor |A|: %.2f m/s² (Threshold: %.1f) • Filtered shakes: %d",
+                          smoothedMag,
+                          peakThreshold,
+                          rejectedShakes
+                      )
+                      refreshUI()
+                  }
+              }
+          
+              override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
+          
+              private fun cardBg(colorHex: String, radiusDp: Float = 42f): GradientDrawable {
+                  return GradientDrawable().apply {
+                      setColor(Color.parseColor(colorHex))
+                      cornerRadius = radiusDp
+                  }
+              }
+          
+              private fun buildRootLayout(): View {
+                  val scroll = ScrollView(this).apply {
+                      setBackgroundColor(Color.parseColor("#090D16"))
+                  }
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(44, 56, 44, 72)
+                  }
+          
+                  // Header Row
+                  val header = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                  }
+                  val title = TextView(this).apply {
+                      text = "StepLite Pedometer"
+                      textSize = 22f
+                      setTextColor(Color.WHITE)
+                      typeface = Typeface.DEFAULT_BOLD
+                      layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                  }
+                  btnTrackToggle = Button(this).apply {
+                      text = "Active"
+                      setTextColor(Color.parseColor("#022C22"))
+                      background = cardBg("#10B981", 60f)
+                      setOnClickListener {
+                          isTracking = !isTracking
+                          text = if (isTracking) "Active" else "Paused"
+                          background = cardBg(if (isTracking) "#10B981" else "#F59E0B", 60f)
+                          registerSensors()
+                      }
+                  }
+                  header.addView(title)
+                  header.addView(btnTrackToggle)
+                  root.addView(header)
+          
+                  // Hero Step Counter Card
+                  val heroCard = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      gravity = Gravity.CENTER_HORIZONTAL
+                      background = cardBg("#111827", 48f)
+                      setPadding(48, 52, 48, 52)
+                      layoutParams = LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT,
+                          LinearLayout.LayoutParams.WRAP_CONTENT
+                      ).apply { topMargin = 36 }
+                  }
+          
+                  tvSteps = TextView(this).apply {
+                      text = "0"
+                      textSize = 48f
+                      setTextColor(Color.parseColor("#34D399"))
+                      typeface = Typeface.DEFAULT_BOLD
+                  }
+                  tvGoalSub = TextView(this).apply {
+                      text = "Goal: 6,000 steps (0%)"
+                      textSize = 14f
+                      setTextColor(Color.parseColor("#94A3B8"))
+                  }
+                  progressRing = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+                      max = 100
+                      progress = 0
+                      layoutParams = LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT,
+                          28
+                      ).apply { topMargin = 28; bottomMargin = 28 }
+                  }
+          
+                  // Distance & Calories Row
+                  val metricsRow = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER
+                  }
+                  tvDistance = TextView(this).apply {
+                      text = "0.00 km"
+                      textSize = 16f
+                      setTextColor(Color.WHITE)
+                      typeface = Typeface.DEFAULT_BOLD
+                      setPadding(0, 0, 48, 0)
+                  }
+                  tvCalories = TextView(this).apply {
+                      text = "0 kcal"
+                      textSize = 16f
+                      setTextColor(Color.parseColor("#FBBF24"))
+                      typeface = Typeface.DEFAULT_BOLD
+                  }
+                  metricsRow.addView(tvDistance)
+                  metricsRow.addView(tvCalories)
+          
+                  val btnPlusStep = Button(this).apply {
+                      text = "+1 Step (Test)"
+                      setTextColor(Color.WHITE)
+                      background = cardBg("#1E293B", 40f)
+                      layoutParams = LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.WRAP_CONTENT,
+                          LinearLayout.LayoutParams.WRAP_CONTENT
+                      ).apply { topMargin = 28 }
+                      setOnClickListener {
+                          stepsToday = db.addStepsToday(1, dailyGoal)
+                          refreshUI()
+                      }
+                  }
+          
+                  tvLiveAccel = TextView(this).apply {
+                      text = "Sensor |A|: 9.81 m/s² (Threshold: 11.8)"
+                      textSize = 11f
+                      setTextColor(Color.parseColor("#38BDF8"))
+                      setPadding(0, 24, 0, 0)
+                  }
+          
+                  heroCard.addView(tvSteps)
+                  heroCard.addView(tvGoalSub)
+                  heroCard.addView(progressRing)
+                  heroCard.addView(metricsRow)
+                  heroCard.addView(btnPlusStep)
+                  heroCard.addView(tvLiveAccel)
+                  root.addView(heroCard)
+          
+                  // Multi-Year History Switcher Card
+                  val histCard = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      background = cardBg("#111827", 48f)
+                      setPadding(44, 44, 44, 44)
+                      layoutParams = LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT,
+                          LinearLayout.LayoutParams.WRAP_CONTENT
+                      ).apply { topMargin = 36 }
+                  }
+          
+                  tvHistoryTitle = TextView(this).apply {
+                      text = "Multi-Year History (7 Days)"
+                      textSize = 17f
+                      setTextColor(Color.WHITE)
+                      typeface = Typeface.DEFAULT_BOLD
+                  }
+                  histCard.addView(tvHistoryTitle)
+          
+                  val tabsRow = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      layoutParams = LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT,
+                          LinearLayout.LayoutParams.WRAP_CONTENT
+                      ).apply { topMargin = 24; bottomMargin = 24 }
+                  }
+          
+                  listOf(
+                      "7D" to "7 Days",
+                      "30D" to "30 Days",
+                      "12M" to "12 Months",
+                      "YEARS" to "5 Years"
+                  ).forEach { (code, label) ->
+                      val b = Button(this).apply {
+                          text = label
+                          textSize = 11f
+                          setTextColor(Color.WHITE)
+                          background = cardBg("#1E293B", 28f)
+                          layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                              marginEnd = 10
+                          }
+                          setOnClickListener {
+                              historyMode = code
+                              refreshUI()
+                          }
+                      }
+                      tabsRow.addView(b)
+                  }
+                  histCard.addView(tabsRow)
+          
+                  historyContainer = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                  }
+                  histCard.addView(historyContainer)
+                  root.addView(histCard)
+          
+                  // Sensitivity Calibration Card
+                  val calCard = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      background = cardBg("#111827", 48f)
+                      setPadding(44, 44, 44, 44)
+                      layoutParams = LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT,
+                          LinearLayout.LayoutParams.WRAP_CONTENT
+                      ).apply { topMargin = 36 }
+                  }
+                  val calTitle = TextView(this).apply {
+                      text = "Basic Phone Accelerometer Sensitivity"
+                      textSize = 15f
+                      setTextColor(Color.WHITE)
+                      typeface = Typeface.DEFAULT_BOLD
+                  }
+                  val seek = SeekBar(this).apply {
+                      max = 32 // 10.6 to 13.8 m/s²
+                      progress = 12
+                      setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                          override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
+                              peakThreshold = 10.6f + (p * 0.1f)
+                          }
+                          override fun onStartTrackingTouch(s: SeekBar?) = Unit
+                          override fun onStopTrackingTouch(s: SeekBar?) = Unit
+                      })
+                  }
+                  calCard.addView(calTitle)
+                  calCard.addView(seek)
+                  root.addView(calCard)
+          
+                  scroll.addView(root)
+                  return scroll
+              }
+          
+              private fun refreshUI() {
+                  tvSteps.text = String.format(Locale.US, "%,d", stepsToday)
+                  val pct = ((stepsToday.toFloat() / dailyGoal) * 100f).roundToInt().coerceIn(0, 100)
+                  tvGoalSub.text = String.format(Locale.US, "Goal: %,d steps (%d%%)", dailyGoal, pct)
+                  progressRing.progress = pct
+          
+                  val distKm = (stepsToday * (strideCm / 100f)) / 1000f
+                  val kcal = (stepsToday * 0.04f).roundToInt()
+                  tvDistance.text = String.format(Locale.US, "%.2f km", distKm)
+                  tvCalories.text = String.format(Locale.US, "%,d kcal", kcal)
+          
+                  val stats = when (historyMode) {
+                      "30D" -> {
+                          tvHistoryTitle.text = "Last 30 Days History"
+                          db.getLastNDays(30).takeLast(10)
+                      }
+                      "12M" -> {
+                          tvHistoryTitle.text = "12-Month Breakdown (Current Year)"
+                          db.getMonthlyTotalsForCurrentYear()
+                      }
+                      "YEARS" -> {
+                          tvHistoryTitle.text = "Multi-Year All-Time History"
+                          db.getMultiYearTotals()
+                      }
+                      else -> {
+                          tvHistoryTitle.text = "Last 7 Days History"
+                          db.getLastNDays(7)
+                      }
+                  }
+          
+                  historyContainer.removeAllViews()
+                  for (item in stats) {
+                      val row = TextView(this).apply {
+                          val itemKm = (item.steps * (strideCm / 100f)) / 1000f
+                          text = String.format(
+                              Locale.US,
+                              "%s:  %,d steps  (%.2f km)",
+                              item.fullLabel,
+                              item.steps,
+                              itemKm
+                          )
+                          textSize = 13f
+                          setTextColor(Color.parseColor("#CBD5E1"))
+                          setPadding(0, 10, 0, 10)
+                      }
+                      historyContainer.addView(row)
+                  }
+              }
+          }
+          EOF_FILE
+
+      - name: Accept Android SDK Licenses & Compile Debug APK
+        working-directory: build_workspace
+        run: |
+          if [ -n "$ANDROID_HOME" ] && [ -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then
+            yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
+          fi
           gradle assembleDebug --no-daemon --stacktrace
-      - uses: actions/upload-artifact@v4
+
+      - name: Upload Compiled APK Artifact
+        uses: actions/upload-artifact@v4
         with:
           name: StepLite-Installable-APK
-          path: "**/app/build/outputs/apk/debug/app-debug.apk"
+          path: build_workspace/app/build/outputs/apk/debug/app-debug.apk
